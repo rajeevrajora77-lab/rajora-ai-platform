@@ -1,0 +1,182 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: rajora-ai
+  ECS_CLUSTER: rajora-ai-production
+  ECS_SERVICE: rajora-api-production
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: rajora_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Cache Python dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('backend/requirements.txt') }}
+      
+      - name: Install dependencies
+        run: |
+          cd backend
+          pip install -r requirements.txt
+      
+      - name: Run pytest
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/rajora_test
+          REDIS_URL: redis://localhost:6379/0
+        run: |
+          cd backend
+          pytest tests/ -v --cov=. --cov-report=xml
+      
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./backend/coverage.xml
+  
+  lint:
+    name: Lint Code
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      
+      - name: Install frontend dependencies
+        run: npm ci
+      
+      - name: Run ESLint
+        run: npm run lint
+      
+      - name: Type check
+        run: npm run type-check
+  
+  build-and-push:
+    name: Build and Push Docker Images
+    needs: [test, lint]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      
+      - name: Build, tag, and push API image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:api-$IMAGE_TAG -f infrastructure/docker/Dockerfile.api .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:api-$IMAGE_TAG
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:api-$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:api-latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:api-latest
+      
+      - name: Build, tag, and push Frontend image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:frontend-$IMAGE_TAG -f infrastructure/docker/Dockerfile.frontend .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:frontend-$IMAGE_TAG
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:frontend-$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:frontend-latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:frontend-latest
+  
+  deploy:
+    name: Deploy to ECS (Blue-Green)
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Deploy to ECS with CodeDeploy
+        run: |
+          # Create new task definition revision
+          aws ecs describe-task-definition --task-definition rajora-api-production \
+            --query taskDefinition > task-definition.json
+          
+          # Update image tag
+          jq '.containerDefinitions[0].image = "'"$ECR_REGISTRY/$ECR_REPOSITORY:api-${{ github.sha }}"'"' \
+            task-definition.json > new-task-definition.json
+          
+          # Register new task definition
+          aws ecs register-task-definition --cli-input-json file://new-task-definition.json
+          
+          # Trigger CodeDeploy blue-green deployment
+          aws deploy create-deployment \
+            --application-name rajora-ai-app \
+            --deployment-group-name rajora-ai-dg \
+            --deployment-config-name CodeDeployDefault.ECSCanary10Percent5Minutes \
+            --description "Deployment of commit ${{ github.sha }}"
+      
+      - name: Wait for deployment
+        run: |
+          aws deploy wait deployment-successful --deployment-id $DEPLOYMENT_ID
+      
+      - name: Notify deployment success
+        if: success()
+        run: |
+          echo "Deployment successful!"
+          # Add Slack/Discord notification here
